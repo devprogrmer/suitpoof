@@ -1,0 +1,36 @@
+# Logs
+*.log
+
+# Temp files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Build/output
+dist/
+build/
+target/
+
+# Archives
+*.zip
+*.tar
+*.gz
+*.rar
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Local runtime/config leftovers
+*.pid
+*.sock
