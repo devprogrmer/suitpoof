@@ -1,130 +1,137 @@
-use anyhow::{Context, Result};
-use bytes::Bytes;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info, warn};
+use anyhow::{bail, Result};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::packet::{PacketKind, SuitPacket};
-
-#[derive(Debug, Clone)]
-pub struct PortForwardRule {
-    pub listen_addr: SocketAddr,
-    pub target_addr: SocketAddr,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PacketKind {
+    Data = 0,
+    Syn = 1,
+    SynAck = 2,
+    Fin = 3,
+    Heartbeat = 4,
+    HeartbeatAck = 5,
 }
 
+impl TryFrom<u8> for PacketKind {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PacketKind::Data),
+            1 => Ok(PacketKind::Syn),
+            2 => Ok(PacketKind::SynAck),
+            3 => Ok(PacketKind::Fin),
+            4 => Ok(PacketKind::Heartbeat),
+            5 => Ok(PacketKind::HeartbeatAck),
+            _ => bail!("invalid PacketKind {}", value),
+        }
+    }
+}
+
+// Suit packet format:
+// [magic:4][version:1][kind:1][tunnel_id:4][seq:4][payload...]
+const CURRENT_PROTOCOL_VERSION: u8 = 0x01;
+const MAGIC: u32 = 0x5B005B00;
+
 #[derive(Debug, Clone)]
-pub struct ForwardFrame {
+pub struct SuitPacket {
+    pub kind: PacketKind,
     pub tunnel_id: u32,
-    pub packet: SuitPacket,
+    pub seq: u32,
+    pub payload: Bytes,
 }
 
-pub struct PortForwardManager {
-    rules: Vec<PortForwardRule>,
-    next_tunnel_id: Arc<Mutex<u32>>,
-    tcp_writers: Arc<Mutex<HashMap<u32, mpsc::Sender<Bytes>>>>,
-    out_tx: mpsc::Sender<ForwardFrame>,
-}
-
-impl PortForwardManager {
-    pub fn new(rules: Vec<PortForwardRule>, out_tx: mpsc::Sender<ForwardFrame>) -> Self {
+impl SuitPacket {
+    pub fn new_syn(tunnel_id: u32, seq: u32) -> Self {
         Self {
-            rules,
-            next_tunnel_id: Arc::new(Mutex::new(1)),
-            tcp_writers: Arc::new(Mutex::new(HashMap::new())),
-            out_tx,
-        }
-    }
-
-    pub async fn run(self: Arc<Self>) -> Result<()> {
-        if self.rules.is_empty() {
-            warn!("port_forward: no rules configured");
-            return Ok(());
-        }
-
-        for rule in self.rules.clone() {
-            let this = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = this.run_rule(rule).await {
-                    error!("port_forward rule task exited with error: {e:#}");
-                }
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn run_rule(self: Arc<Self>, rule: PortForwardRule) -> Result<()> {
-        let listener = TcpListener::bind(rule.listen_addr)
-            .await
-            .with_context(|| format!("bind failed on {}", rule.listen_addr))?;
-
-        info!(
-            "port_forward listening on {} -> remote target {}",
-            rule.listen_addr, rule.target_addr
-        );
-
-        loop {
-            let (stream, peer) = listener.accept().await.context("accept failed")?;
-            let this = self.clone();
-            let rule_cloned = rule.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) = this.handle_local_tcp(stream, peer, rule_cloned).await {
-                    warn!("port_forward connection {} closed with error: {e:#}", peer);
-                }
-            });
-        }
-    }
-
-    async fn alloc_tunnel_id(&self) -> u32 {
-        let mut g = self.next_tunnel_id.lock().await;
-        let id = *g;
-        *g = g.wrapping_add(1).max(1);
-        id
-    }
-
-    async fn handle_local_tcp(
-        self: Arc<Self>,
-        stream: TcpStream,
-        peer: SocketAddr,
-        rule: PortForwardRule,
-    ) -> Result<()> {
-        let tunnel_id = self.alloc_tunnel_id().await;
-        info!(
-            "port_forward new tcp {} -> {} (tunnel_id={})",
-            peer, rule.target_addr, tunnel_id
-        );
-
-        let (_tcp_read, mut _tcp_write) = stream.into_split();
-        let (to_tcp_tx, mut _to_tcp_rx) = mpsc::channel::<Bytes>(1024);
-
-        {
-            let mut writers = self.tcp_writers.lock().await;
-            writers.insert(tunnel_id, to_tcp_tx);
-        }
-
-        let syn_payload = Bytes::from(rule.target_addr.to_string().into_bytes());
-
-        self.send_packet(
+            kind: PacketKind::Syn,
             tunnel_id,
-            SuitPacket {
-                kind: PacketKind::Syn,
-                payload: syn_payload,
-            },
-        )
-        .await?;
-
-        Ok(())
+            seq,
+            payload: Bytes::new(),
+        }
     }
 
-    async fn send_packet(&self, tunnel_id: u32, packet: SuitPacket) -> Result<()> {
-        self.out_tx
-            .send(ForwardFrame { tunnel_id, packet })
-            .await
-            .context("failed to send forward frame")
+    pub fn new_syn_ack(tunnel_id: u32, seq: u32) -> Self {
+        Self {
+            kind: PacketKind::SynAck,
+            tunnel_id,
+            seq,
+            payload: Bytes::new(),
+        }
+    }
+
+    pub fn new_data(tunnel_id: u32, seq: u32, payload: Bytes) -> Self {
+        Self {
+            kind: PacketKind::Data,
+            tunnel_id,
+            seq,
+            payload,
+        }
+    }
+
+    pub fn new_heartbeat(tunnel_id: u32, seq: u32) -> Self {
+        Self {
+            kind: PacketKind::Heartbeat,
+            tunnel_id,
+            seq,
+            payload: Bytes::new(),
+        }
+    }
+
+    pub fn new_heartbeat_ack(tunnel_id: u32, seq: u32) -> Self {
+        Self {
+            kind: PacketKind::HeartbeatAck,
+            tunnel_id,
+            seq,
+            payload: Bytes::new(),
+        }
+    }
+
+    pub fn new_fin(tunnel_id: u32) -> Self {
+        Self {
+            kind: PacketKind::Fin,
+            tunnel_id,
+            seq: 0,
+            payload: Bytes::new(),
+        }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(14 + self.payload.len());
+        buf.put_u32(MAGIC);
+        buf.put_u8(CURRENT_PROTOCOL_VERSION);
+        buf.put_u8(self.kind as u8);
+        buf.put_u32(self.tunnel_id);
+        buf.put_u32(self.seq);
+        buf.extend_from_slice(&self.payload);
+        buf.freeze()
+    }
+
+    pub fn decode(mut buf: Bytes) -> Result<Self> {
+        if buf.len() < 14 {
+            bail!("packet too short: {}", buf.len());
+        }
+
+        let magic = buf.get_u32();
+        if magic != MAGIC {
+            bail!("invalid magic: {:#x}", magic);
+        }
+
+        let version = buf.get_u8();
+        if version != CURRENT_PROTOCOL_VERSION {
+            bail!("unsupported protocol version: {}", version);
+        }
+
+        let kind = PacketKind::try_from(buf.get_u8())?;
+        let tunnel_id = buf.get_u32();
+        let seq = buf.get_u32();
+        let payload = buf.copy_to_bytes(buf.remaining());
+
+        Ok(Self {
+            kind,
+            tunnel_id,
+            seq,
+            payload,
+        })
     }
 }
