@@ -1,220 +1,296 @@
-//! Configuration structs for the suitspoof server and client.
+//! Configuration structs and parsing from TOML.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::*, time::Duration};
 
-use anyhow::{anyhow, bail, Context, Result};
-use rustls::server::AllowAnyAuthenticatedClient;
-use rustls::Certificate;
-use serde::Deserialize;
-use tokio_rustls::rustls::sign::{self, SigningKey};
-use tokio_rustls::rustls::PrivateKey;
+use anyhow::{anyhow, bail, Result};
+use ip_network::Ipv4Network;
+use serde::{Deserialize, Serialize};
 
-use crate::mux_fec::MuxFecConfig;
-use crate::tuning::Tuning;
+use crate::tuning::{apply_auto_tune, Tuning};
 use crate::xor::XorCipher;
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+// Enums
+
+/// Role of the suitspoof instance (client or server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Client,
     Server,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+/// Protocols for suitspoof uplink and downlink connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TunnelProtocol {
     Udp,
-    Icmp,
     Tcp,
+    Icmp,
+    Quic,
     Proto58,
     Ipip,
     Gre,
-    Quic,
 }
 
-impl FromStr for TunnelProtocol {
-    type Err = anyhow::Error;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DpiObfuscation {
+    pub enabled: bool,
+    pub packet_padding: bool,
+    pub ttl_jitter: bool,
+    pub fake_tls_header: bool,
+    pub random_dscp: bool,
+}
 
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "udp" => Ok(Self::Udp),
-            "icmp" => Ok(Self::Icmp),
-            "tcp" => Ok(Self::Tcp),
-            "proto58" => Ok(Self::Proto58),
-            "ipip" => Ok(Self::Ipip),
-            "gre" => Ok(Self::Gre),
-            "quic" => Ok(Self::Quic),
-            _ => bail!("unknown protocol '{}'", s),
+impl Default for DpiObfuscation {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            packet_padding: false,
+            ttl_jitter: false,
+            fake_tls_header: false,
+            random_dscp: false,
         }
     }
 }
 
-impl TunnelProtocol {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Udp => "udp",
-            Self::Icmp => "icmp",
-            Self::Tcp => "tcp",
-            Self::Proto58 => "proto58",
-            Self::Ipip => "ipip",
-            Self::Gre => "gre",
-            Self::Quic => "quic",
+/// Mux/FEC configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuxFec {
+    pub enabled: bool,
+    pub group_size: u32,
+}
+
+impl MuxFec {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled && self.group_size > 0
+    }
+}
+
+impl Default for MuxFec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            group_size: 10,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// Config
+
+/// Full configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Client or server role.
     pub role: Role,
+
+    /// Log level (`trace`, `debug`, `info`, `warn`, `error`).
     pub log_level: String,
 
+    /// Local address to bind to.
     pub listen_addr: SocketAddr,
+
+    /// Remote peer address (client-side only).
     pub peer_addr: SocketAddr,
+
+    /// Real IP address of the peer.
     pub peer_real_ip: Ipv4Addr,
+
+    /// Spoofed IP address of the peer.
     pub peer_spoofed_ip: Ipv4Addr,
+
+    /// Name of the TUN device.
     pub tun_name: String,
+
+    /// MTU of the TUN device.
     pub tun_mtu: u16,
+
+    /// IP address of the TUN device.
     pub tun_ip: Ipv4Addr,
+
+    /// Peer IP address of the TUN device.
     pub tun_peer_ip: Ipv4Addr,
+
+    /// CIDR of the TUN network.
     pub tun_cidr: u8,
+
+    /// Netmask of the TUN device.
+    #[serde(skip)]
+    pub tun_netmask: Ipv4Addr,
+
+    /// DNS servers for the TUN device.
     pub dns_servers: Vec<Ipv4Addr>,
 
+    /// Uplink tunnel protocol.
     pub uplink_protocol: TunnelProtocol,
+
+    /// Downlink tunnel protocol.
     pub downlink_protocol: TunnelProtocol,
+
+    /// Data port.
     pub data_port: u16,
+
+    /// Shuffle data port.
     pub data_port_shuffle: bool,
+
+    /// Range of data ports to shuffle.
     pub data_port_range: (u16, u16),
 
+    /// XOR key for encryption.
     pub xor_key: String,
-    pub dpi_obfuscation: bool,
 
+    /// DPI obfuscation settings.
+    #[serde(default)]
+    pub dpi_obfuscation: DpiObfuscation,
+
+    /// Path to TLS certificate.
     pub tls_cert_path: String,
+
+    /// Path to TLS key.
     pub tls_key_path: String,
+
+    /// Path to TLS CA certificate.
     pub tls_ca_cert_path: String,
 
+    /// Allowed peer IPs (server-side only).
     pub allowed_peers: Vec<Ipv4Addr>,
 
+    /// Tunnel idle timeout in seconds.
     pub tunnel_idle_timeout_secs: u64,
+
+    /// Handshake timeout in seconds.
     pub handshake_timeout_secs: u64,
+
+    /// Heartbeat interval in seconds.
     pub heartbeat_interval_secs: u64,
+
+    /// Channel capacity.
     pub channel_capacity: usize,
+
+    /// IO channel capacity.
     pub io_channel_capacity: usize,
+
+    /// Number of runtime threads.
     pub runtime_threads: usize,
+
+    /// ICMP ID.
     pub icmp_id: u16,
+
+    /// Random ICMP ID.
     pub random_icmp_id: bool,
 
+    /// Enable multiplexing.
+    #[serde(default)]
     pub enable_multiplex: bool,
-    pub multiplex_flush_ms: u64,
-    pub multiplex_max_payload: usize,
-    pub enable_fec: bool,
-    pub fec_group_size: u8,
 
+    /// Multiplex flush interval in milliseconds.
+    #[serde(default)]
+    pub multiplex_flush_ms: u64,
+
+    /// Multiplex maximum payload size.
+    #[serde(default)]
+    pub multiplex_max_payload: u16,
+
+    /// Enable FEC.
+    #[serde(default)]
+    pub enable_fec: bool,
+
+    /// FEC group size.
+    #[serde(default)]
+    pub fec_group_size: u32,
+
+    /// Tuning settings.
+    #[serde(default)]
     pub tuning: Option<Tuning>,
 
+    /// Check mode (client-side only).
+    #[serde(default)]
     pub check_mode: bool,
+
+    /// Path to check IPs file (client-side only).
+    #[serde(default)]
     pub check_ips_path: String,
+
+    /// Path to check output file (client-side only).
+    #[serde(default)]
     pub check_output_path: String,
+
+    /// Check timeout in seconds (client-side only).
+    #[serde(default)]
     pub check_timeout: Duration,
+
+    /// Number of check workers (client-side only).
+    #[serde(default)]
     pub check_workers: usize,
+
+    /// Number of tunnels to open (client-side only).
+    #[serde(default)]
+    pub tunnel_count: usize,
+
+    /// List of TCP/UDP ports to forward (client-side only).
+    #[serde(default)]
+    pub forward_ports: Vec<String>,
+
+    /// Actual MTU being used (after clamping).
+    #[serde(skip)]
+    pub mtu: u16,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            role: Role::Client,
+            log_level: "info".to_string(),
+            listen_addr: "0.0.0.0:0".parse().unwrap(),
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+            peer_real_ip: Ipv4Addr::new(10, 0, 0, 1),
+            peer_spoofed_ip: Ipv4Addr::new(10, 0, 0, 2),
+            tun_name: "tun0".to_string(),
+            tun_mtu: 1500,
+            tun_ip: Ipv4Addr::new(10, 0, 0, 3),
+            tun_peer_ip: Ipv4Addr::new(10, 0, 0, 4),
+            tun_cidr: 24,
+            tun_netmask: Ipv4Addr::new(0, 0, 0, 0),
+            dns_servers: vec![],
+            uplink_protocol: TunnelProtocol::Udp,
+            downlink_protocol: TunnelProtocol::Udp,
+            data_port: 12345,
+            data_port_shuffle: false,
+            data_port_range: (0, 0),
+            xor_key: "".to_string(),
+            dpi_obfuscation: DpiObfuscation::default(),
+            tls_cert_path: "".to_string(),
+            tls_key_path: "".to_string(),
+            tls_ca_cert_path: "".to_string(),
+            allowed_peers: Vec::new(),
+            tunnel_idle_timeout_secs: 300,
+            handshake_timeout_secs: 10,
+            heartbeat_interval_secs: 10,
+            channel_capacity: 100,
+            io_channel_capacity: 100,
+            runtime_threads: 0,
+            icmp_id: 0,
+            random_icmp_id: false,
+            enable_multiplex: false,
+            multiplex_flush_ms: 0,
+            multiplex_max_payload: 0,
+            enable_fec: false,
+            fec_group_size: 0,
+            tuning: Some(Tuning::default()),
+            check_mode: false,
+            check_ips_path: "".to_string(),
+            check_output_path: "".to_string(),
+            check_timeout: Duration::from_secs(0),
+            check_workers: 0,
+            tunnel_count: 1,
+            forward_ports: Vec::new(),
+            mtu: 1500,
+        }
+    }
 }
 
 impl Config {
-    pub fn from_file(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("read config file {}", path))?;
-        let cfg: Self = toml::from_str(&content)
-            .with_context(|| format!("parse config file {}", path))?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    pub fn is_client(&self) -> bool {
-        self.role == Role::Client
-    }
-
-    pub fn tun_socket_addr(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.tun_ip, 0)
-    }
-
-    pub fn tun_peer_socket_addr(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.tun_peer_ip, 0)
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.tun_mtu < 576 || self.tun_mtu > 9000 {
-            bail!("tun_mtu must be between 576 and 9000");
-        }
-        if self.tun_cidr == 0 || self.tun_cidr > 32 {
-            bail!("tun_cidr must be between 1 and 32");
-        }
-        if self.data_port == 0 {
-            bail!("data_port must be non-zero");
-        }
-        if self.data_port_range.0 == 0 || self.data_port_range.1 == 0 {
-            bail!("data_port_range must be non-zero");
-        }
-        if self.data_port_shuffle {
-            if self.data_port_range.0 >= self.data_port_range.1 {
-                bail!("data_port_range start must be less than end");
-            }
-            if self.data_port_range.1 - self.data_port_range.0 < 100 {
-                log::warn!(
-                    "data_port_range is small; consider a range of at least 100 ports for better shuffling"
-                );
-            }
-        }
-        if self.tunnel_idle_timeout_secs < 10 {
-            bail!("tunnel_idle_timeout_secs must be at least 10");
-        }
-        if self.handshake_timeout_secs < 5 {
-            bail!("handshake_timeout_secs must be at least 5");
-        }
-        if self.heartbeat_interval_secs < 1 {
-            bail!("heartbeat_interval_secs must be at least 1");
-        }
-        if self.channel_capacity < 1 {
-            bail!("channel_capacity must be at least 1");
-        }
-        if self.io_channel_capacity < 1 {
-            bail!("io_channel_capacity must be at least 1");
-        }
-        if self.runtime_threads == 0 {
-            bail!("runtime_threads must be non-zero");
-        }
-
-        if self.uplink_protocol == TunnelProtocol::Quic
-            || self.downlink_protocol == TunnelProtocol::Quic
-        {
-            if self.enable_multiplex || self.enable_fec {
-                log::warn!("mux-fec is not used with QUIC transports");
-            }
-        }
-
-        if self.enable_multiplex || self.enable_fec {
-            self.mux_fec_config().validate()?;
-        }
-
-        self.validate_xor_key()?;
-
-        if self.check_mode {
-            if self.check_ips_path.is_empty() {
-                bail!("check_ips_path must be set in check_mode");
-            }
-            if self.check_output_path.is_empty() {
-                bail!("check_output_path must be set in check_mode");
-            }
-            if self.check_timeout < Duration::from_secs(1) {
-                bail!("check_timeout must be at least 1 second");
-            }
-            if self.check_workers == 0 {
-                bail!("check_workers must be non-zero");
-            }
-        }
-
-        Ok(())
-    }
+    /// Minimum suitspoof MTU: IP header (20) + UDP header (8) + XOR key (1) + tunnel packet header (20)
+    pub const MIN_MTU: u16 = 20 + 8 + 1 + 20;
 
     pub fn xor_cipher(&self) -> Option<XorCipher> {
         if self.xor_key.is_empty() {
@@ -223,249 +299,409 @@ impl Config {
         Some(XorCipher::new(&self.xor_key))
     }
 
-    fn validate_xor_key(&self) -> Result<()> {
-        if !self.xor_key.is_empty() && self.xor_key.len() < 16 {
-            bail!("xor_key must be at least 16 bytes (characters)");
+    pub fn dpi_obfuscation(&self) -> DpiObfuscation {
+        if !self.dpi_obfuscation.enabled {
+            return DpiObfuscation {
+                enabled: false,
+                ..Default::default()
+            };
         }
-        Ok(())
+        self.dpi_obfuscation.clone()
     }
 
-    pub fn mux_fec_config(&self) -> MuxFecConfig {
-        MuxFecConfig {
-            enable_multiplex: self.enable_multiplex,
-            multiplex_flush_ms: self.multiplex_flush_ms,
-            multiplex_max_payload: self.multiplex_max_payload,
-            enable_fec: self.enable_fec,
-            fec_group_size: self.fec_group_size,
+    pub fn mux_fec_config(&self) -> MuxFec {
+        if !self.enable_fec {
+            return MuxFec {
+                enabled: false,
+                ..Default::default()
+            };
+        }
+        MuxFec {
+            enabled: true,
+            group_size: self.fec_group_size,
         }
     }
 
-    pub fn build_tls_client_config(&self) -> Result<tokio_rustls::rustls::ClientConfig> {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in load_certs(&self.tls_ca_cert_path)? {
-            roots.add(&cert)?;
+    pub fn build_data_port_pool(&self) -> Result<Option<Vec<u16>>> {
+        if !self.data_port_shuffle {
+            return Ok(None);
         }
-        let client_cert = load_certs(&self.tls_cert_path)?;
-        let client_key = load_private_key(&self.tls_key_path)?;
-        let config = tokio_rustls::rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(client_cert, client_key)?;
-        Ok(config)
+
+        if self.data_port_range.0 == 0 || self.data_port_range.1 == 0 {
+            bail!("data_port_range must be set when data_port_shuffle is enabled");
+        }
+
+        if self.data_port_range.0 > self.data_port_range.1 {
+            bail!("data_port_range.0 must be <= data_port_range.1");
+        }
+
+        if self.data_port == 0 {
+            bail!("data_port must be set when data_port_shuffle is enabled");
+        }
+
+        let mut ports: Vec<u16> = (self.data_port_range.0..=self.data_port_range.1).collect();
+        ports.retain(|&p| p != self.data_port);
+
+        if ports.is_empty() {
+            bail!("data_port_range does not contain any ports other than data_port");
+        }
+
+        Ok(Some(ports))
     }
 
-    pub fn build_tls_server_config(&self) -> Result<tokio_rustls::rustls::ServerConfig> {
-        let certs = load_certs(&self.tls_cert_path)?;
-        let key = load_private_key(&self.tls_key_path)?;
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in load_certs(&self.tls_ca_cert_path)? {
-            roots.add(&cert)?;
+    pub fn shuffle_port_range(&self) -> (u16, u16) {
+        if self.data_port_shuffle {
+            self.data_port_range
+        } else {
+            (0, 0)
         }
-        let client_auth = AllowAnyAuthenticatedClient::new(roots);
-        let config = tokio_rustls::rustls::ServerConfig::builder()
-            .with_safe_defaults()
-            .with_client_cert_verifier(client_auth)
-            .with_single_cert(certs, key)
-            .map_err(|e| anyhow!("build_tls_server_config: {}", e))?;
-        Ok(config)
     }
 
-    pub fn pick_icmp_id(&self) -> u16 {
+    pub fn pick_spoofed_ip(&self) -> Ipv4Addr {
+        if self.role == Role::Server {
+            self.peer_spoofed_ip
+        } else {
+            self.tun_ip
+        }
+    }
+
+    pub fn is_peer_allowed(&self, ip: &Ipv4Addr) -> bool {
+        if self.allowed_peers.is_empty() {
+            return true;
+        }
+        self.allowed_peers.contains(ip)
+    }
+
+    pub fn effective_forward_ports(&self) -> Vec<(IpProtocol, u16)> {
+        let mut ports = Vec::new();
+
+        for port_str in &self.forward_ports {
+            let parts: Vec<&str> = port_str.split('/').collect();
+            if parts.len() != 2 {
+                log::warn!("invalid forward_port format: {}", port_str);
+                continue;
+            }
+
+            let protocol = match parts[0].to_lowercase().as_str() {
+                "tcp" => IpProtocol::Tcp,
+                "udp" => IpProtocol::Udp,
+                _ => {
+                    log::warn!("unknown protocol for forward_port: {}", parts[0]);
+                    continue;
+                }
+            };
+
+            let port: u16 = match parts[1].parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("invalid port for forward_port {}: {}", parts[1], e);
+                    continue;
+                }
+            };
+
+            ports.push((protocol, port));
+        }
+
+        ports
+    }
+
+    pub fn get_random_icmp_id(&self) -> u16 {
         if self.random_icmp_id {
-            rand::random()
+            use rand::Rng;
+            rand::thread_rng().gen_range(0..65535)
         } else {
             self.icmp_id
         }
     }
 
-    pub fn shuffle_port_range(&self) -> std::ops::Range<u16> {
-        self.data_port_range.0..self.data_port_range.1
-    }
+    pub async fn resolve_peer_addr(&mut self) -> Result<()> {
+        if self.peer_addr.ip().is_unspecified() {
+            log::info!("resolving peer_addr: {}", self.peer_addr.ip());
+            let ips = tokio::net::lookup_host(self.peer_addr.to_string())
+                .await?
+                .collect::<Vec<_>>();
 
-    pub fn build_data_port_pool(&self) -> Result<Option<Arc<Vec<u16>>>> {
-        if !self.data_port_shuffle {
-            return Ok(None);
+            if ips.is_empty() {
+                bail!("could not resolve peer_addr: {}", self.peer_addr);
+            }
+
+            self.peer_addr = ips[0];
+            log::info!("resolved peer_addr: {}", self.peer_addr);
         }
-        let ports = shuffle_ports(self.data_port_range.0, self.data_port_range.1)?;
-        Ok(Some(Arc::new(ports)))
-    }
-}
 
-pub fn pick_data_port(default_port: u16, pool: &Option<Arc<Vec<u16>>>) -> u16 {
-    if let Some(p) = pool {
-        let idx = rand::random::<usize>() % p.len();
-        p[idx]
-    } else {
-        default_port
-    }
-}
-
-pub fn shuffle_ports(min: u16, max: u16) -> Result<Vec<u16>> {
-    let count = max - min;
-    if count == 0 {
-        bail!("port range is empty");
-    }
-    let mut ports: Vec<u16> = (min..max).collect();
-    for i in (1..ports.len()).rev() {
-        let j = rand::random::<usize>() % (i + 1);
-        ports.swap(i, j);
-    }
-    Ok(ports)
-}
-
-fn load_certs(path: &str) -> Result<Vec<Certificate>> {
-    let cert_file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut reader)?
-        .into_iter()
-        .map(Certificate)
-        .collect();
-    Ok(certs)
-}
-
-fn load_private_key(path: &str) -> Result<PrivateKey> {
-    let key_bytes = std::fs::read(path)?;
-    Ok(PrivateKey(key_bytes))
-}
-
-#[derive(Debug, Deserialize, serde::Serialize)]
-pub struct License {
-    pub name: String,
-    pub expiry: u64,
-    pub max_tunnels: u32,
-    pub key_bytes: Vec<u8>,
-}
-
-impl License {
-    pub fn new(name: String, expiry: u64, max_tunnels: u32, key_bytes: Vec<u8>) -> Self {
-        Self {
-            name,
-            expiry,
-            max_tunnels,
-            key_bytes,
-        }
-    }
-
-    pub fn from_file(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let lic: Self = serde_json::from_str(&content)?;
-        Ok(lic)
-    }
-
-    pub fn decode(b64_key: &str, password: &str) -> Result<Self> {
-        let key_bytes = base64::decode(b64_key)?;
-        let decrypted = Self::decrypt_with_password(&key_bytes, password)?;
-        let lic: Self = serde_json::from_slice(&decrypted)?;
-        Ok(lic)
-    }
-
-    pub fn encrypt_with_password(data: &[u8], password: &str) -> Result<Vec<u8>> {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
-        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-
-        let salt = SaltString::generate(&mut rand::thread_rng());
-        let argon2 = Argon2::default();
-        let hash = argon2.hash_password(password.as_bytes(), &salt)?;
-        let key = hash.hash.as_ref().context("no hash")?.as_bytes();
-        let key = Key::<Aes256Gcm>::from_slice(&key[..32]);
-        let cipher = Aes256Gcm::new(key);
-
-        let nonce = Nonce::from_slice(b"suitspoof-non");
-        let encrypted_data = cipher.encrypt(nonce, data)?;
-
-        let mut output = salt.as_str().as_bytes().to_vec();
-        output.extend_from_slice(b":");
-        output.extend_from_slice(&encrypted_data);
-
-        Ok(output)
-    }
-
-    pub fn decrypt_with_password(encrypted_data: &[u8], password: &str) -> Result<Vec<u8>> {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
-        use argon2::password_hash::SaltString;
-        use argon2::{Argon2, PasswordHasher};
-
-        let parts: Vec<&[u8]> = encrypted_data.splitn(2, |&b| b == b':').collect();
-        if parts.len() != 2 {
-            bail!("invalid encrypted data format");
-        }
-        let salt_bytes = parts[0];
-        let encrypted_payload = parts[1];
-
-        let salt_str = std::str::from_utf8(salt_bytes)?;
-        let salt = SaltString::from_str(salt_str)?;
-
-        let argon2 = Argon2::default();
-        let expected_hash = argon2.hash_password(password.as_bytes(), &salt)?;
-
-        let key = expected_hash.hash.as_ref().context("no hash")?.as_bytes();
-        let key = Key::<Aes256Gcm>::from_slice(&key[..32]);
-        let cipher = Aes256Gcm::new(key);
-
-        let nonce = Nonce::from_slice(b"suitspoof-non");
-        let decrypted_data = cipher.decrypt(nonce, encrypted_payload.as_ref())?;
-        Ok(decrypted_data)
-    }
-
-    pub async fn read_key_pem(path: &str) -> Result<Vec<u8>> {
-        let key_pem = tokio::fs::read_to_string(path).await?;
-        let key_bytes =
-            tokio_rustls::rustls::sign::any_ecdsa_type(&PrivateKey(key_pem.as_bytes().to_vec()))
-                .map_err(|_| anyhow!("invalid key file"))?;
-        Ok(key_bytes.public_key().to_vec())
-    }
-
-    pub async fn sign(key: &PrivateKey, data: &[u8]) -> Result<Vec<u8>> {
-        let signing_key = sign::any_ecdsa_type(key).map_err(|_| anyhow!("invalid key file"))?;
-        let signature = signing_key.sign(data)?;
-        Ok(signature.as_ref().to_vec())
-    }
-
-    pub async fn verify_signature(
-        _key_bytes: &[u8],
-        _signature: &[u8],
-        _data: &[u8],
-    ) -> Result<()> {
         Ok(())
     }
 
-    pub fn to_jwt_token(&self, secret: &[u8]) -> Result<String> {
-        use jsonwebtoken::{encode, EncodingKey, Header};
-
-        let token = encode(
-            &Header::default(),
-            self,
-            &EncodingKey::from_secret(secret),
-        )?;
-        Ok(token)
+    pub fn build_config_string(&self) -> String {
+        format!(
+            "
+            Role: {}
+            Log Level: {}
+            Listen Addr: {}
+            Peer Addr: {}
+            Peer Real IP: {}
+            Peer Spoofed IP: {}
+            TUN Name: {}
+            TUN MTU: {}
+            TUN IP: {}
+            TUN Peer IP: {}
+            TUN CIDR: {}
+            DNS Servers: {:?}
+            Uplink Protocol: {:?}
+            Downlink Protocol: {:?}
+            Data Port: {}
+            Data Port Shuffle: {}
+            Data Port Range: {:?}
+            XOR Key: {}
+            DPI Obfuscation Enabled: {}
+            DPI Packet Padding: {}
+            DPI TTL Jitter: {}
+            DPI Fake TLS Header: {}
+            DPI Random DSCP: {}
+            TLS Cert Path: {}
+            TLS Key Path: {}
+            TLS CA Cert Path: {}
+            Allowed Peers: {:?}
+            Tunnel Idle Timeout (secs): {}
+            Handshake Timeout (secs): {}
+            Heartbeat Interval (secs): {}
+            Channel Capacity: {}
+            IO Channel Capacity: {}
+            Runtime Threads: {}
+            ICMP ID: {}
+            Random ICMP ID: {}
+            Enable Multiplex: {}
+            Multiplex Flush MS: {}
+            Multiplex Max Payload: {}
+            Enable FEC: {}
+            FEC Group Size: {}
+            Tuning Enabled: {}
+            Auto IO Threads: {}
+            Auto Runtime Threads: {}
+            Auto Channel Capacity: {}
+            Auto Multiplex Flush MS: {}
+            Auto Multiplex Max Payload: {}
+            Auto FEC Group Size: {}
+            Auto Heartbeat Interval Secs: {}
+            Auto Tunnel Idle Timeout Secs: {}
+            Check Mode: {}
+            Check IPs Path: {}
+            Check Output Path: {}
+            Check Timeout: {:?}
+            Check Workers: {}
+            Tunnel Count: {}
+            Forward Ports: {:?}
+            Actual MTU: {}
+            ",
+            self.role,
+            self.log_level,
+            self.listen_addr,
+            self.peer_addr,
+            self.peer_real_ip,
+            self.peer_spoofed_ip,
+            self.tun_name,
+            self.tun_mtu,
+            self.tun_ip,
+            self.tun_peer_ip,
+            self.tun_cidr,
+            self.dns_servers,
+            self.uplink_protocol,
+            self.downlink_protocol,
+            self.data_port,
+            self.data_port_shuffle,
+            self.data_port_range,
+            if self.xor_key.is_empty() {
+                "None"
+            } else {
+                "[REDACTED]"
+            },
+            self.dpi_obfuscation.enabled,
+            self.dpi_obfuscation.packet_padding,
+            self.dpi_obfuscation.ttl_jitter,
+            self.dpi_obfuscation.fake_tls_header,
+            self.dpi_obfuscation.random_dscp,
+            self.tls_cert_path,
+            self.tls_key_path,
+            self.tls_ca_cert_path,
+            self.allowed_peers,
+            self.tunnel_idle_timeout_secs,
+            self.handshake_timeout_secs,
+            self.heartbeat_interval_secs,
+            self.channel_capacity,
+            self.io_channel_capacity,
+            self.runtime_threads,
+            self.icmp_id,
+            self.random_icmp_id,
+            self.enable_multiplex,
+            self.multiplex_flush_ms,
+            self.multiplex_max_payload,
+            self.enable_fec,
+            self.fec_group_size,
+            self.tuning.as_ref().map_or(false, |t| t.enabled),
+            self.tuning.as_ref().map_or(false, |t| t.auto_io_threads),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_runtime_threads),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_channel_capacity),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_multiplex_flush_ms),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_multiplex_max_payload),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_fec_group_size),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_heartbeat_interval_secs),
+            self.tuning
+                .as_ref()
+                .map_or(false, |t| t.auto_tunnel_idle_timeout_secs),
+            self.check_mode,
+            self.check_ips_path,
+            self.check_output_path,
+            self.check_timeout,
+            self.check_workers,
+            self.tunnel_count,
+            self.forward_ports,
+            self.mtu,
+        )
     }
 
-    pub fn from_jwt_token(token: &str, secret: &[u8]) -> Result<Self> {
-        use jsonwebtoken::{decode, DecodingKey, Validation};
+    pub async fn from_file(path: &str) -> Result<Self> {
+        let file_content = tokio::fs::read_to_string(path).await?;
+        let mut cfg: Config = toml::from_str(&file_content)?;
 
-        let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-        let token_data = decode::<Self>(
-            token,
-            &DecodingKey::from_secret(secret),
-            &validation,
-        )?;
-        Ok(token_data.claims)
+        if let Some(summary) = apply_auto_tune(&mut cfg) {
+            for line in summary.lines() {
+                log::info!("{}", line);
+            }
+        }
+
+        cfg.tun_netmask = Ipv4Network::new(cfg.tun_ip, cfg.tun_cidr)
+            .map_err(|e| anyhow!("invalid tun_ip/tun_cidr: {}", e))?
+            .netmask();
+
+        cfg.mtu = if cfg.tun_mtu == 0 {
+            1500
+        } else {
+            cfg.tun_mtu.max(Config::MIN_MTU)
+        };
+
+        cfg.check_integrity().await?;
+        Ok(cfg)
+    }
+
+    async fn check_integrity(&self) -> Result<()> {
+        if self.role == Role::Client && self.tun_mtu < Config::MIN_MTU {
+            bail!(
+                "tun_mtu ({}) must be at least {} (IP header + UDP header + XOR key + tunnel packet header)",
+                self.tun_mtu,
+                Config::MIN_MTU
+            );
+        }
+
+        if self.tunnel_idle_timeout_secs < self.handshake_timeout_secs {
+            bail!(
+                "tunnel_idle_timeout_secs ({}) must be >= handshake_timeout_secs ({})",
+                self.tunnel_idle_timeout_secs,
+                self.handshake_timeout_secs
+            );
+        }
+
+        if self.peer_real_ip.is_multicast()
+            || self.peer_real_ip.is_broadcast()
+            || self.peer_real_ip.is_unspecified()
+        {
+            bail!(
+                "peer_real_ip ({}) must be a valid unicast IP address",
+                self.peer_real_ip
+            );
+        }
+
+        if self.peer_spoofed_ip.is_multicast()
+            || self.peer_spoofed_ip.is_broadcast()
+            || self.peer_spoofed_ip.is_unspecified()
+        {
+            bail!(
+                "peer_spoofed_ip ({}) must be a valid unicast IP address",
+                self.peer_spoofed_ip
+            );
+        }
+
+        if self.tun_ip.is_multicast() || self.tun_ip.is_broadcast() || self.tun_ip.is_unspecified()
+        {
+            bail!("tun_ip ({}) must be a valid unicast IP address", self.tun_ip);
+        }
+
+        if self.tun_peer_ip.is_multicast()
+            || self.tun_peer_ip.is_broadcast()
+            || self.tun_peer_ip.is_unspecified()
+        {
+            bail!(
+                "tun_peer_ip ({}) must be a valid unicast IP address",
+                self.tun_peer_ip
+            );
+        }
+
+        let network = Ipv4Network::new(self.tun_ip, self.tun_cidr)
+            .map_err(|e| anyhow!("invalid tun_ip/tun_cidr: {}", e))?;
+
+        if !network.contains(self.tun_peer_ip) {
+            bail!(
+                "tun_peer_ip ({}) is not in tun_ip network ({})",
+                self.tun_peer_ip,
+                network
+            );
+        }
+
+        // Ensure that the given log level is a valid simplelog level.
+        // If not, it will cause suitspoof to crash at startup.
+        match self.log_level.to_lowercase().as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            _ => bail!("invalid log_level: {}", self.log_level),
+        }
+
+        // Ensure that `quic` is only used when both uplink and downlink protocols are set to `quic`.
+        // If only one is `quic`, it will cause errors at startup of suitspoof.
+        let use_quic = self.uplink_protocol == TunnelProtocol::Quic
+            || self.downlink_protocol == TunnelProtocol::Quic;
+
+        if use_quic
+            && (self.uplink_protocol != TunnelProtocol::Quic
+                || self.downlink_protocol != TunnelProtocol::Quic)
+        {
+            bail!("quic requires both uplink_protocol and downlink_protocol = quic");
+        }
+
+        if use_quic && self.mux_fec_config().is_enabled() {
+            log::warn!("mux/fec is ignored when using quic transport");
+        }
+
+        if self.uplink_protocol == TunnelProtocol::Tcp && self.mux_fec_config().is_enabled() {
+            log::warn!("mux/fec is ignored when using tcp transport");
+        }
+
+        if use_quic && self.data_port_shuffle {
+            bail!("data_port_shuffle is not supported with quic transport");
+        }
+
+        Ok(())
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Jwks {
-    pub keys: Vec<Jwk>,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpProtocol {
+    Tcp,
+    Udp,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Jwk {
-    pub kty: String,
-    pub kid: String,
-    pub alg: String,
-    pub crv: String,
-    pub x: String,
-    pub y: String,
+impl Default for IpProtocol {
+    fn default() -> Self {
+        IpProtocol::Tcp
+    }
 }
