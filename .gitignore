@@ -1,36 +1,35 @@
-# Logs
-*.log
+# OS
+.DS_Store
+Thumbs.db
 
-# Temp files
-*.tmp
-*.temp
+# Editors
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
 
-# Build/output
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+temp/
+*.tmp
+
+# Build / artifacts
 dist/
 build/
-target/
-
-# Archives
-*.zip
+out/
 *.tar
-*.gz
-*.rar
+*.tar.gz
+*.zip
 
-# Environment files
+# Env
 .env
 .env.*
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# Editor/IDE
-.vscode/
-.idea/
-
-# Local runtime/config leftovers
+# Linux service/runtime leftovers
 *.pid
 *.sock
