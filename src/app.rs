@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
 use async_channel as mpsc;
+use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
@@ -81,7 +81,7 @@ pub async fn verify_license(password: &str) -> Result<()> {
 
 pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
     log::info!(
-        "CandyTunnel client starting | real={} spoof={} peer={}",
+        "suitspoof client starting | real={} spoof={} peer={}",
         cfg.real_ip,
         cfg.spoofed_ip,
         cfg.peer_real_ip
@@ -89,6 +89,7 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
 
     let use_quic = cfg.uplink_protocol == TunnelProtocol::Quic
         || cfg.downlink_protocol == TunnelProtocol::Quic;
+
     if use_quic
         && (cfg.uplink_protocol != TunnelProtocol::Quic
             || cfg.downlink_protocol != TunnelProtocol::Quic)
@@ -111,7 +112,8 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
         cfg.downlink_protocol,
         use_quic,
         cfg.mux_fec_config().is_enabled(),
-        matches!(cfg.uplink_protocol, TunnelProtocol::Proto58) || matches!(cfg.downlink_protocol, TunnelProtocol::Proto58),
+        matches!(cfg.uplink_protocol, TunnelProtocol::Proto58)
+            || matches!(cfg.downlink_protocol, TunnelProtocol::Proto58),
         cfg.shuffle_data_port,
         cfg.shuffle_port_range()
     );
@@ -128,8 +130,14 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
 
     let xor_cipher = cfg.xor_cipher();
     let dpi = cfg.dpi_obfuscation();
-    log::debug!("client xor_encryption={} dpi_padding={} ttl_jitter={} fake_tls={} dscp={}",
-        xor_cipher.is_some(), dpi.packet_padding, dpi.ttl_jitter, dpi.fake_tls_header, dpi.random_dscp);
+    log::debug!(
+        "client xor_encryption={} dpi_padding={} ttl_jitter={} fake_tls={} dscp={}",
+        xor_cipher.is_some(),
+        dpi.packet_padding,
+        dpi.ttl_jitter,
+        dpi.fake_tls_header,
+        dpi.random_dscp
+    );
     let sender = RawSender::spawn(cfg.io_channel_capacity, xor_cipher.clone(), dpi.clone())?;
 
     let mut allowed = cfg.allowed_peers.clone();
@@ -154,15 +162,22 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
         )?;
         let peer_addr = PeerAddr {
             local_spoof: cfg.pick_spoofed_ip(),
-            peer_real:   cfg.peer_real_ip,
-            data_port:   cfg.data_port,
-            data_ports:  data_ports.clone(),
-            icmp_id:     cfg.icmp_id,
+            peer_real: cfg.peer_real_ip,
+            data_port: cfg.data_port,
+            data_ports: data_ports.clone(),
+            icmp_id: cfg.icmp_id,
             random_icmp_id: cfg.random_icmp_id,
-            is_server:   false,
+            is_server: false,
         };
         let mux_fec = if cfg.mux_fec_config().is_enabled()
-            && matches!(cfg.uplink_protocol, TunnelProtocol::Udp | TunnelProtocol::Icmp | TunnelProtocol::Proto58 | TunnelProtocol::Ipip | TunnelProtocol::Gre) {
+            && matches!(
+                cfg.uplink_protocol,
+                TunnelProtocol::Udp
+                    | TunnelProtocol::Icmp
+                    | TunnelProtocol::Proto58
+                    | TunnelProtocol::Ipip
+                    | TunnelProtocol::Gre
+            ) {
             Some(crate::mux_fec::MuxFecSender::spawn(
                 cfg.mux_fec_config(),
                 sender.clone(),
@@ -174,7 +189,11 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
             None
         };
         (
-            PacketSender::Raw { sender, addr: peer_addr, mux_fec },
+            PacketSender::Raw {
+                sender,
+                addr: peer_addr,
+                mux_fec,
+            },
             PacketReceiver::Raw(rx),
         )
     };
@@ -184,17 +203,19 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
     let mgr2 = manager.clone();
     tokio::spawn(async move {
         loop {
-            let Some(incoming) = receiver.recv().await else { break; };
-            log::trace!("client recv packet kind={:?} src={}", incoming.pkt.kind, incoming.src_ip);
-            if let Err(e) = mgr2
-                .handle_incoming(incoming.src_ip, incoming.pkt)
-                .await
-            {
+            let Some(incoming) = receiver.recv().await else {
+                break;
+            };
+            log::trace!(
+                "client recv packet kind={:?} src={}",
+                incoming.pkt.kind,
+                incoming.src_ip
+            );
+            if let Err(e) = mgr2.handle_incoming(incoming.src_ip, incoming.pkt).await {
                 log::warn!("handle_incoming: {}", e);
             }
         }
-    }
-    );
+    });
 
     let mgr3 = manager.clone();
     tokio::spawn(async move {
@@ -204,20 +225,18 @@ pub async fn run_client(cfg: Arc<Config>) -> Result<()> {
                 log::warn!("tick: {}", e);
             }
         }
-    }
-    );
+    });
 
     run_tun_client(cfg, manager).await
 }
 
 pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
-    // License verification should be handled by the server binary.
     if cfg.channel_capacity == 0 {
         bail!("channel_capacity must be > 0");
     }
 
     log::info!(
-        "CandyTunnel server starting | real={} spoof={} peer={}",
+        "suitspoof server starting | real={} spoof={} peer={}",
         cfg.real_ip,
         cfg.spoofed_ip,
         cfg.peer_real_ip
@@ -225,6 +244,7 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
 
     let use_quic = cfg.uplink_protocol == TunnelProtocol::Quic
         || cfg.downlink_protocol == TunnelProtocol::Quic;
+
     if use_quic
         && (cfg.uplink_protocol != TunnelProtocol::Quic
             || cfg.downlink_protocol != TunnelProtocol::Quic)
@@ -247,7 +267,8 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
         cfg.downlink_protocol,
         use_quic,
         cfg.mux_fec_config().is_enabled(),
-        matches!(cfg.uplink_protocol, TunnelProtocol::Proto58) || matches!(cfg.downlink_protocol, TunnelProtocol::Proto58),
+        matches!(cfg.uplink_protocol, TunnelProtocol::Proto58)
+            || matches!(cfg.downlink_protocol, TunnelProtocol::Proto58),
         cfg.shuffle_data_port,
         cfg.shuffle_port_range(),
         allow_any
@@ -265,11 +286,21 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
 
     let xor_cipher = cfg.xor_cipher();
     let dpi = cfg.dpi_obfuscation();
-    log::debug!("server xor_encryption={} dpi_padding={} ttl_jitter={} fake_tls={} dscp={}",
-        xor_cipher.is_some(), dpi.packet_padding, dpi.ttl_jitter, dpi.fake_tls_header, dpi.random_dscp);
+    log::debug!(
+        "server xor_encryption={} dpi_padding={} ttl_jitter={} fake_tls={} dscp={}",
+        xor_cipher.is_some(),
+        dpi.packet_padding,
+        dpi.ttl_jitter,
+        dpi.fake_tls_header,
+        dpi.random_dscp
+    );
     let sender = RawSender::spawn(cfg.io_channel_capacity, xor_cipher.clone(), dpi.clone())?;
 
-    let mut allowed = if allow_any { Vec::new() } else { cfg.allowed_peers.clone() };
+    let mut allowed = if allow_any {
+        Vec::new()
+    } else {
+        cfg.allowed_peers.clone()
+    };
     if !allow_any {
         allowed.push(cfg.peer_real_ip);
         allowed.push(cfg.peer_spoofed_ip);
@@ -293,15 +324,22 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
         )?;
         let peer_addr = PeerAddr {
             local_spoof: cfg.pick_spoofed_ip(),
-            peer_real:   cfg.peer_real_ip,
-            data_port:   cfg.data_port,
-            data_ports:  data_ports.clone(),
-            icmp_id:     cfg.icmp_id,
+            peer_real: cfg.peer_real_ip,
+            data_port: cfg.data_port,
+            data_ports: data_ports.clone(),
+            icmp_id: cfg.icmp_id,
             random_icmp_id: cfg.random_icmp_id,
-            is_server:   true,
+            is_server: true,
         };
         let mux_fec = if cfg.mux_fec_config().is_enabled()
-            && matches!(cfg.uplink_protocol, TunnelProtocol::Udp | TunnelProtocol::Icmp | TunnelProtocol::Proto58 | TunnelProtocol::Ipip | TunnelProtocol::Gre) {
+            && matches!(
+                cfg.uplink_protocol,
+                TunnelProtocol::Udp
+                    | TunnelProtocol::Icmp
+                    | TunnelProtocol::Proto58
+                    | TunnelProtocol::Ipip
+                    | TunnelProtocol::Gre
+            ) {
             Some(crate::mux_fec::MuxFecSender::spawn(
                 cfg.mux_fec_config(),
                 sender.clone(),
@@ -313,14 +351,22 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
             None
         };
         (
-            PacketSender::Raw { sender, addr: peer_addr, mux_fec },
+            PacketSender::Raw {
+                sender,
+                addr: peer_addr,
+                mux_fec,
+            },
             PacketReceiver::Raw(rx),
         )
     };
 
     let manager = TunnelManager::new(packet_sender, cfg.clone());
 
-    let tun_mtu = if cfg.tun_mtu == 0 { cfg.mtu } else { cfg.tun_mtu.min(cfg.mtu) };
+    let tun_mtu = if cfg.tun_mtu == 0 {
+        cfg.mtu
+    } else {
+        cfg.tun_mtu.min(cfg.mtu)
+    };
     if cfg.tun_mtu > cfg.mtu {
         log::warn!("tun_mtu {} > mtu {} - clamping", cfg.tun_mtu, cfg.mtu);
     }
@@ -335,7 +381,8 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
 
     let pool = TunnelPool::new();
 
-    let (net_to_tun_tx, net_to_tun_rx): (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) = mpsc::bounded(cfg.channel_capacity);
+    let (net_to_tun_tx, net_to_tun_rx): (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) =
+        mpsc::bounded(cfg.channel_capacity);
     spawn_tun_writer(tun.clone(), net_to_tun_rx);
 
     let tun_reader = tun.clone();
@@ -344,8 +391,7 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
         if let Err(e) = run_tun_reader(tun_reader, pool_reader, &[]).await {
             log::warn!("tun reader stopped: {}", e);
         }
-    }
-    );
+    });
 
     log::info!(
         "TUN {} up ({} <-> {}) mtu {}",
@@ -363,37 +409,35 @@ pub async fn run_server(cfg: Arc<Config>, allow_any: bool) -> Result<()> {
                 log::warn!("tick: {}", e);
             }
         }
-    }
-    );
+    });
 
     loop {
         let incoming = match receiver.recv().await {
             Some(p) => p,
-            None    => break,
+            None => break,
         };
 
-        log::trace!("server recv packet kind={:?} src={}", incoming.pkt.kind, incoming.src_ip);
+        log::trace!(
+            "server recv packet kind={:?} src={}",
+            incoming.pkt.kind,
+            incoming.src_ip
+        );
 
         if !allow_any && !cfg.is_peer_allowed(&incoming.src_ip) {
             log::trace!("dropping packet from disallowed IP {}", incoming.src_ip);
             continue;
         }
 
-        match manager
-            .handle_incoming(incoming.src_ip, incoming.pkt)
-            .await
-        {
-            Ok(Some((syn_pkt, src_ip))) => {
-                match manager.accept_syn(syn_pkt, src_ip).await {
-                    Ok((tid, app_rx, net_tx)) => {
-                        pool.add_tunnel(tid, net_tx).await;
-                        spawn_tunnel_to_tun(app_rx, net_to_tun_tx.clone());
-                        log::info!("tunnel {} ready", tid);
-                    }
-                    Err(e) => log::warn!("accept_syn: {}", e),
+        match manager.handle_incoming(incoming.src_ip, incoming.pkt).await {
+            Ok(Some((syn_pkt, src_ip))) => match manager.accept_syn(syn_pkt, src_ip).await {
+                Ok((tid, app_rx, net_tx)) => {
+                    pool.add_tunnel(tid, net_tx).await;
+                    spawn_tunnel_to_tun(app_rx, net_to_tun_tx.clone());
+                    log::info!("tunnel {} ready", tid);
                 }
-            }
-            Ok(None) => {},
+                Err(e) => log::warn!("accept_syn: {}", e),
+            },
+            Ok(None) => {}
             Err(e) => log::warn!("handle_incoming: {}", e),
         }
     }
@@ -433,7 +477,8 @@ async fn run_tun_client(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
 
     let pool = TunnelPool::new();
 
-    let (net_to_tun_tx, net_to_tun_rx): (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) = mpsc::bounded(cfg.channel_capacity);
+    let (net_to_tun_tx, net_to_tun_rx): (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) =
+        mpsc::bounded(cfg.channel_capacity);
     spawn_tun_writer(tun.clone(), net_to_tun_rx);
 
     for _ in 0..cfg.tunnel_count {
