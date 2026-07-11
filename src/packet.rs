@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-#[derive(Debug, Clone, PartialEq, Eq)] // اضافه کردن PartialEq, Eq برای مقایسه
+#[derive(Debug, Clone, PartialEq, Eq)] // 
 pub enum PacketKind {
     Syn,
     Data,
