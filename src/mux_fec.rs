@@ -1,9 +1,3 @@
-//! Multiplexing and FEC layer for UDP/ICMP transports.
-//!
-//! This layer batches multiple CandyPacket payloads into a single wire frame
-//! (multiplexing) and optionally adds XOR parity frames (FEC). It is not used
-//! for QUIC.
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -515,5 +509,61 @@ impl Encoder {
     }
 
     async fn flush_batch(&mut self) -> Result<()> {
-        let batch: Vec<Bytes> = self.batch.drain(..).collect();
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch_to_send = self.batch.drain(..).collect();
         self.batch_size = 0;
+
+        let _ = self.send_frame(batch_to_send).await;
+
+        Ok(())
+    }
+
+    fn build_out_packet(&self, frame: Bytes) -> Result<Bytes> {
+        match self.protocol {
+            crate::config::TunnelProtocol::Udp => {
+                let mut out_packet = OutPacket {
+                    payload: frame,
+                    dst: self.addr,
+                    src: None,
+                    icmp_seq: None,
+                };
+                 Ok(frame)
+            }
+            crate::config::TunnelProtocol::Icmp => {
+                 let mut out_packet = OutPacket {
+                    payload: frame,
+                    dst: self.addr,
+                    src: None,
+                    icmp_seq: Some(self.icmp_seq),
+                };
+                 Ok(frame)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RecvEvent {
+    Packet(Bytes),
+    Timeout,
+    Closed,
+}
+
+fn estimate_mux_size_with_packet(batch: &[Bytes], pkt: &Bytes) -> usize {
+    let mut current_size = 0;
+    for b in batch {
+        current_size += packet_mux_size(b);
+    }
+    current_size + packet_mux_size(pkt)
+}
+
+fn packet_mux_size(pkt: &Bytes) -> usize {
+    pkt.len() + 2
+}
+
+#[cfg(test)]
+mod tests {
+    // ...
+}
