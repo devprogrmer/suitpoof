@@ -10,39 +10,22 @@ use tracing::{debug, error, info, warn};
 
 use crate::packet::{PacketKind, SuitPacket};
 
-/// Local port-forward rule.
-///
-/// Example:
-/// - listen_addr = 127.0.0.1:1081
-/// - target_addr = 127.0.0.1:1080
-///
-/// Incoming TCP on listen_addr is tunneled and connected to target_addr on peer side.
 #[derive(Debug, Clone)]
 pub struct PortForwardRule {
     pub listen_addr: SocketAddr,
     pub target_addr: SocketAddr,
 }
 
-/// Frame emitted by port-forward side and should be sent through tunnel transport.
 #[derive(Debug, Clone)]
 pub struct ForwardFrame {
     pub tunnel_id: u32,
     pub packet: SuitPacket,
 }
 
-/// TCP port-forward manager (local listener side).
-///
-/// This module is intentionally transport-agnostic:
-/// - It emits `ForwardFrame` for outbound tunnel send path.
-/// - It accepts inbound `SuitPacket` from tunnel receive path.
 pub struct PortForwardManager {
     rules: Vec<PortForwardRule>,
     next_tunnel_id: Arc<Mutex<u32>>,
-
-    /// tunnel_id -> writer channel (to TCP stream task)
     tcp_writers: Arc<Mutex<HashMap<u32, mpsc::Sender<Bytes>>>>,
-
-    /// outbound frames to tunnel transport
     out_tx: mpsc::Sender<ForwardFrame>,
 }
 
@@ -56,7 +39,6 @@ impl PortForwardManager {
         }
     }
 
-    /// Start listeners for all configured rules.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         if self.rules.is_empty() {
             warn!("port_forward: no rules configured");
@@ -125,7 +107,20 @@ impl PortForwardManager {
             writers.insert(tunnel_id, to_tcp_tx);
         }
 
-        // Send SYN (includes target addr as payload).
         let syn_payload = Bytes::from(rule.target_addr.to_string().into_bytes());
-        self.send_packet(SuitPacket {
+        
+        self.send_packet(tunnel_id, SuitPacket {
             kind: PacketKind::Syn,
+            payload: syn_payload,
+        }).await?;
+
+        Ok(())
+    }
+
+    async fn send_packet(&self, tunnel_id: u32, packet: SuitPacket) -> Result<()> {
+        self.out_tx
+            .send(ForwardFrame { tunnel_id, packet })
+            .await
+            .context("failed to send forward frame")
+    }
+}
