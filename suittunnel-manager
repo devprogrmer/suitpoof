@@ -19,7 +19,7 @@ BIN_PATH="${INSTALL_DIR}/${BIN_NAME}"
 VERSION_FILE="${INSTALL_DIR}/VERSION"
 
 REPO_OWNER="devprogrmer"
-REPO_NAME="suitspoof"
+REPO_NAME="suitpoof"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 
 BOLD='\033[1m'; DIM='\033[2m'
