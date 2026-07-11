@@ -1,4 +1,7 @@
 # SuitTunnel Manager
+[![ShellCheck](https://github.com/devprogrmer/suitspoof/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/devprogrmer/suitspoof/actions/workflows/shellcheck.yml)
+[![Release](https://github.com/devprogrmer/suitspoof/actions/workflows/release.yml/badge.svg)](https://github.com/devprogrmer/suitspoof/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Operational toolkit for deploying and managing **SuitTunnel** (formerly CandyTunnel), an IP-spoofing-focused tunneling system for filtered or unstable networks.
 
