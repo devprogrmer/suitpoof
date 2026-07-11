@@ -1,1 +1,496 @@
+#!/usr/bin/env bash
+# suit-manager.sh
+# SuitTunnel Manager (hardened, no feature removal)
+# Version: 3.0.0
+set -Eeuo pipefail
+IFS=$'\n\t'
 
+APP_NAME="SuitTunnel"
+BIN_NAME="suit-tunnel"
+SERVICE_PREFIX="suittunnel"
+
+INSTALL_DIR="/opt/suittunnel"
+CONFIG_DIR="/etc/suittunnel"
+STATE_DIR="/var/lib/suittunnel"
+LOG_DIR="/var/log/suittunnel"
+SYSTEMD_DIR="/etc/systemd/system"
+
+BIN_PATH="${INSTALL_DIR}/${BIN_NAME}"
+VERSION_FILE="${INSTALL_DIR}/VERSION"
+
+REPO_OWNER="AmiRCandy"
+REPO_NAME="CandyTunnel"
+GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+
+BOLD='\033[1m'; DIM='\033[2m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; RESET='\033[0m'
+
+info(){ echo -e "${CYAN}[INFO]${RESET}  $*"; }
+ok(){ echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+err(){ echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+die(){ err "$*"; exit 1; }
+
+on_err() {
+  local exit_code=$?
+  err "Command failed (exit=${exit_code}) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+  exit "${exit_code}"
+}
+trap on_err ERR
+
+require_root(){ [[ "${EUID}" -eq 0 ]] || die "Run as root."; }
+
+need_cmd(){
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "Missing dependency: $c"
+  done
+}
+
+ensure_dirs(){
+  mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
+  chmod 750 "${CONFIG_DIR}" || true
+}
+
+random_hex(){
+  local n="${1:-32}"
+  head -c "${n}" /dev/urandom | xxd -p -c "${n}"
+}
+
+ask(){
+  local __var="$1" __prompt="$2" __default="${3:-}" __val
+  if [[ -n "${__default}" ]]; then
+    read -r -p "${__prompt} [${__default}]: " __val
+    __val="${__val:-${__default}}"
+  else
+    read -r -p "${__prompt}: " __val
+  fi
+  printf -v "${__var}" "%s" "${__val}"
+}
+
+ask_bool(){
+  local __var="$1" __prompt="$2" __default="${3:-n}" __ans
+  while true; do
+    read -r -p "${__prompt} [y/n,${__default}]: " __ans
+    __ans="${__ans:-${__default}}"
+    case "${__ans,,}" in
+      y|yes) printf -v "${__var}" "true"; return;;
+      n|no)  printf -v "${__var}" "false"; return;;
+      *) echo "Please enter y or n.";;
+    esac
+  done
+}
+
+validate_ip(){
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    ((o>=0 && o<=255)) || return 1
+  done
+  return 0
+}
+
+validate_port(){
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  ((p>=1 && p<=65535))
+}
+
+get_latest_version(){
+  curl -fsSL "${GITHUB_API}" | grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+get_download_url(){
+  local j
+  j="$(curl -fsSL "${GITHUB_API}")"
+  echo "${j}" | grep '"browser_download_url"' | sed -E 's/.*"([^"]+)".*/\1/' | \
+    grep -E 'linux.*(x86_64|amd64)|SuitTunnel|CandyTunnel' | head -n1
+}
+
+ensure_service_template(){
+  local unit="${SYSTEMD_DIR}/${SERVICE_PREFIX}@.service"
+  if [[ -f "${unit}" ]]; then return; fi
+
+  cat > "${unit}" <<EOF
+[Unit]
+Description=${APP_NAME} instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${BIN_PATH} --config ${CONFIG_DIR}/%i.toml
+WorkingDirectory=${INSTALL_DIR}
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  ok "Created ${SERVICE_PREFIX}@.service"
+}
+
+cmd_download(){
+  require_root
+  need_cmd curl sed grep head chmod mv ln
+  ensure_dirs
+
+  local ver url tmp
+  ver="$(get_latest_version || true)"
+  url="$(get_download_url || true)"
+  [[ -n "${url}" ]] || die "Could not detect release asset URL from GitHub API."
+
+  tmp="$(mktemp)"
+  info "Downloading binary..."
+  curl -fL --progress-bar -o "${tmp}" "${url}"
+  chmod +x "${tmp}"
+  mv "${tmp}" "${BIN_PATH}"
+  ln -sf "${BIN_PATH}" /usr/local/bin/${BIN_NAME}
+
+  [[ -n "${ver}" ]] && echo "${ver}" > "${VERSION_FILE}" || echo "unknown" > "${VERSION_FILE}"
+  ensure_service_template
+  ok "Installed: ${BIN_PATH} (version: $(cat "${VERSION_FILE}"))"
+}
+
+cmd_update(){
+  require_root
+  need_cmd systemctl awk grep
+  local installed latest
+  installed="$(cat "${VERSION_FILE}" 2>/dev/null || echo "none")"
+  latest="$(get_latest_version || echo "unknown")"
+
+  if [[ "${installed}" == "${latest}" && "${installed}" != "none" && "${installed}" != "unknown" ]]; then
+    ok "Already up to date: ${installed}"
+    return
+  fi
+
+  info "Updating from ${installed} -> ${latest}"
+  mapfile -t running_units < <(systemctl list-units --type=service --state=active --no-legend \
+    | awk '{print $1}' | grep "^${SERVICE_PREFIX}@.*\.service$" || true)
+
+  for u in "${running_units[@]:-}"; do systemctl stop "${u}" || true; done
+  cmd_download
+  for u in "${running_units[@]:-}"; do systemctl start "${u}" || true; done
+
+  ok "Update complete."
+}
+
+write_config(){
+  local path="$1"
+  cat > "${path}" <<EOF
+role = "${ROLE}"
+
+real_ip = "${REAL_IP}"
+peer_real_ip = "${PEER_REAL_IP}"
+spoofed_ip = "${SPOOFED_IP}"
+spoofed_ip_pool = [${SPOOFED_POOL}]
+peer_spoofed_ip = "${PEER_SPOOFED_IP}"
+
+uplink_protocol = "${UP_PROTO}"
+downlink_protocol = "${DOWN_PROTO}"
+data_port = ${DATA_PORT}
+shuffle_data_port = ${SHUFFLE_PORT}
+shuffle_port_min = ${SHUFFLE_MIN}
+shuffle_port_max = ${SHUFFLE_MAX}
+
+enable_multiplex = ${ENABLE_MUX}
+multiplex_flush_ms = ${MUX_FLUSH}
+multiplex_max_payload = ${MUX_PAYLOAD}
+enable_fec = ${ENABLE_FEC}
+fec_group_size = ${FEC_GROUP}
+
+icmp_id = ${ICMP_ID}
+random_icmp_id = ${RAND_ICMP}
+
+quic_server_name = "${QUIC_SNI}"
+quic_cert = "${QUIC_CERT}"
+quic_key = "${QUIC_KEY}"
+quic_alpn = "${QUIC_ALPN}"
+quic_idle_timeout_ms = ${QUIC_IDLE}
+quic_max_data = ${QUIC_MAX_DATA}
+quic_max_stream_data = ${QUIC_MAX_STREAM_DATA}
+quic_max_streams_bidi = ${QUIC_MAX_STREAMS_BIDI}
+
+pre_shared_key = "${PSK}"
+
+packet_padding = ${PACKET_PADDING}
+packet_padding_max = ${PACKET_PADDING_MAX}
+ttl_jitter = ${TTL_JITTER}
+fake_tls_header = ${FAKE_TLS}
+random_dscp = ${RANDOM_DSCP}
+
+enable_xor = ${ENABLE_XOR}
+log_level = "${LOG_LEVEL}"
+allowed_peers = [${ALLOWED_PEERS}]
+
+perf_mode = "${PERF_MODE}"
+auto_tune = ${AUTO_TUNE}
+tunnel_count = ${TUNNEL_COUNT}
+mtu = ${MTU}
+channel_capacity = ${CHANNEL_CAP}
+io_channel_capacity = ${IO_CHANNEL_CAP}
+runtime_worker_threads = ${WORKERS}
+
+forward_ports = [${FORWARD_PORTS}]
+forward_port = ${FORWARD_PORT}
+
+interface = "${IFACE}"
+tun_name = "${TUN_NAME}"
+tun_ip = "${TUN_IP}"
+tun_peer_ip = "${TUN_PEER_IP}"
+tun_netmask = "${TUN_NETMASK}"
+tun_mtu = ${TUN_MTU}
+EOF
+}
+
+cmd_configure(){
+  require_root
+  ensure_dirs
+  need_cmd xxd head
+
+  local NAME
+  ask NAME "Instance name" "suit0"
+  ask ROLE "Role (client/server)" "client"
+
+  ask REAL_IP "real_ip" "10.0.0.1"; validate_ip "${REAL_IP}" || die "Invalid real_ip"
+  ask PEER_REAL_IP "peer_real_ip" "203.0.113.1"; validate_ip "${PEER_REAL_IP}" || die "Invalid peer_real_ip"
+  ask SPOOFED_IP "spoofed_ip" "8.8.4.4"; validate_ip "${SPOOFED_IP}" || die "Invalid spoofed_ip"
+  ask SPOOFED_POOL 'spoofed_ip_pool (example: "8.8.4.4","1.1.1.1")' "\"${SPOOFED_IP}\""
+  ask PEER_SPOOFED_IP "peer_spoofed_ip" "1.2.3.4"; validate_ip "${PEER_SPOOFED_IP}" || die "Invalid peer_spoofed_ip"
+
+  ask UP_PROTO "uplink_protocol (udp/icmp/proto58/tcp/quic/ipip/gre)" "udp"
+  ask DOWN_PROTO "downlink_protocol (udp/icmp/proto58/tcp/quic/ipip/gre)" "udp"
+
+  ask DATA_PORT "data_port" "51820"; validate_port "${DATA_PORT}" || die "Invalid data_port"
+  ask_bool SHUFFLE_PORT "shuffle_data_port?" "n"
+  ask SHUFFLE_MIN "shuffle_port_min" "49152"
+  ask SHUFFLE_MAX "shuffle_port_max" "65535"
+
+  ask_bool ENABLE_MUX "enable_multiplex?" "y"
+  ask MUX_FLUSH "multiplex_flush_ms" "1"
+  ask MUX_PAYLOAD "multiplex_max_payload" "1380"
+  ask_bool ENABLE_FEC "enable_fec?" "n"
+  ask FEC_GROUP "fec_group_size" "4"
+
+  ask ICMP_ID "icmp_id (decimal or 0x...)" "0x4321"
+  ask_bool RAND_ICMP "random_icmp_id?" "n"
+
+  ask QUIC_SNI "quic_server_name" "SuitTunnel"
+  ask QUIC_CERT "quic_cert path" "/etc/suittunnel/quic_cert.pem"
+  ask QUIC_KEY "quic_key path" "/etc/suittunnel/quic_key.pem"
+  ask QUIC_ALPN "quic_alpn" "h3"
+  ask QUIC_IDLE "quic_idle_timeout_ms" "30000"
+  ask QUIC_MAX_DATA "quic_max_data" "134217728"
+  ask QUIC_MAX_STREAM_DATA "quic_max_stream_data" "16777216"
+  ask QUIC_MAX_STREAMS_BIDI "quic_max_streams_bidi" "256"
+
+  ask PSK "pre_shared_key (empty => random)" ""
+  [[ -z "${PSK}" ]] && PSK="$(random_hex 24)" && info "Generated pre_shared_key: ${PSK}"
+
+  ask_bool PACKET_PADDING "packet_padding?" "n"
+  ask PACKET_PADDING_MAX "packet_padding_max" "64"
+  ask_bool TTL_JITTER "ttl_jitter?" "n"
+  ask_bool FAKE_TLS "fake_tls_header?" "n"
+  ask_bool RANDOM_DSCP "random_dscp?" "n"
+
+  ask_bool ENABLE_XOR "enable_xor?" "n"
+  ask LOG_LEVEL "log_level (trace/debug/info/warn/error)" "info"
+  ask ALLOWED_PEERS 'allowed_peers (example: "1.1.1.1","2.2.2.2")' ""
+
+  ask PERF_MODE "perf_mode (throughput/latency/balanced)" "throughput"
+  ask_bool AUTO_TUNE "auto_tune?" "y"
+  ask TUNNEL_COUNT "tunnel_count" "4"
+  ask MTU "mtu" "1380"
+  ask CHANNEL_CAP "channel_capacity" "8192"
+  ask IO_CHANNEL_CAP "io_channel_capacity" "16384"
+  ask WORKERS "runtime_worker_threads (0=auto)" "0"
+
+  ask FORWARD_PORTS 'forward_ports (example: 8080,8443)' "8080,8443"
+  ask FORWARD_PORT "forward_port (legacy)" "0"
+
+  ask IFACE "interface" "eth0"
+  ask TUN_NAME "tun_name" "suit0"
+  ask TUN_IP "tun_ip" "$([[ "${ROLE}" == "server" ]] && echo "10.66.0.1" || echo "10.66.0.2")"; validate_ip "${TUN_IP}" || die "Invalid tun_ip"
+  ask TUN_PEER_IP "tun_peer_ip" "$([[ "${ROLE}" == "server" ]] && echo "10.66.0.2" || echo "10.66.0.1")"; validate_ip "${TUN_PEER_IP}" || die "Invalid tun_peer_ip"
+  ask TUN_NETMASK "tun_netmask" "255.255.255.252"; validate_ip "${TUN_NETMASK}" || die "Invalid tun_netmask"
+  ask TUN_MTU "tun_mtu" "1380"
+
+  local cfg="${CONFIG_DIR}/${NAME}.toml"
+  write_config "${cfg}"
+  chmod 640 "${cfg}" || true
+  ok "Wrote config: ${cfg}"
+
+  ensure_service_template
+  systemctl enable "${SERVICE_PREFIX}@${NAME}.service" >/dev/null 2>&1 || true
+  ok "Enabled service: ${SERVICE_PREFIX}@${NAME}.service"
+}
+
+cmd_gen_quic_cert(){
+  require_root
+  need_cmd openssl
+  ensure_dirs
+  openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+    -keyout "${CONFIG_DIR}/quic_key.pem" \
+    -out "${CONFIG_DIR}/quic_cert.pem" \
+    -days 3650 -subj "/CN=SuitTunnel"
+  chmod 600 "${CONFIG_DIR}/quic_key.pem" || true
+  chmod 644 "${CONFIG_DIR}/quic_cert.pem" || true
+  ok "Generated QUIC cert/key under ${CONFIG_DIR}"
+}
+
+unit_name(){ echo "${SERVICE_PREFIX}@$1.service"; }
+require_instance(){ [[ -n "${1:-}" ]] || die "Instance name required."; [[ -f "${CONFIG_DIR}/$1.toml" ]] || die "Config not found: ${CONFIG_DIR}/$1.toml"; }
+
+cmd_start(){ require_root; require_instance "${1:-}"; systemctl start "$(unit_name "$1")"; ok "Started $1"; }
+cmd_stop(){ require_root; require_instance "${1:-}"; systemctl stop "$(unit_name "$1")"; ok "Stopped $1"; }
+cmd_restart(){ require_root; require_instance "${1:-}"; systemctl restart "$(unit_name "$1")"; ok "Restarted $1"; }
+cmd_enable(){ require_root; require_instance "${1:-}"; ensure_service_template; systemctl enable "$(unit_name "$1")"; ok "Enabled $1"; }
+cmd_disable(){ require_root; require_instance "${1:-}"; systemctl disable "$(unit_name "$1")"; ok "Disabled $1"; }
+
+cmd_logs(){ local n="${1:-}" lines="${2:-100}"; [[ -n "${n}" ]] || die "Usage: $0 logs <name> [lines]"; journalctl -u "$(unit_name "${n}")" -n "${lines}" --no-pager; }
+cmd_follow(){ local n="${1:-}"; [[ -n "${n}" ]] || die "Usage: $0 follow <name>"; journalctl -u "$(unit_name "${n}")" -f; }
+
+cmd_status(){
+  echo "== Binary =="
+  if [[ -x "${BIN_PATH}" ]]; then
+    echo "installed: yes"
+    echo "version: $(cat "${VERSION_FILE}" 2>/dev/null || echo unknown)"
+  else
+    echo "installed: no"
+  fi
+  echo
+  echo "== Instances =="
+  shopt -s nullglob
+  local f n
+  for f in "${CONFIG_DIR}"/*.toml; do
+    n="$(basename "${f}" .toml)"
+    systemctl is-active --quiet "$(unit_name "${n}")" && echo "${n}: active" || echo "${n}: inactive"
+  done
+  shopt -u nullglob
+}
+
+cmd_list(){ shopt -s nullglob; local f; for f in "${CONFIG_DIR}"/*.toml; do basename "${f}" .toml; done; shopt -u nullglob; }
+
+cmd_check(){
+  require_root
+  need_cmd ip systemctl
+  echo "== System check =="
+  echo "kernel: $(uname -r)"
+  echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)"
+  echo "binary: $([[ -x "${BIN_PATH}" ]] && echo OK || echo MISSING)"
+  echo "config_dir: $([[ -d "${CONFIG_DIR}" ]] && echo OK || echo MISSING)"
+  echo "service_template: $([[ -f "${SYSTEMD_DIR}/${SERVICE_PREFIX}@.service" ]] && echo OK || echo MISSING)"
+}
+
+cmd_remove(){
+  require_root
+  local n="${1:-}"
+  [[ -n "${n}" ]] || die "Usage: $0 remove <name>"
+  systemctl stop "$(unit_name "${n}")" 2>/dev/null || true
+  systemctl disable "$(unit_name "${n}")" 2>/dev/null || true
+  rm -f "${CONFIG_DIR}/${n}.toml"
+  ok "Removed instance ${n}"
+}
+
+cmd_uninstall(){
+  require_root
+  local keep_cfg="${1:-keep-config}"
+
+  mapfile -t units < <(systemctl list-unit-files --type=service --no-legend \
+    | awk '{print $1}' | grep "^${SERVICE_PREFIX}@.*\.service$" || true)
+  for u in "${units[@]:-}"; do
+    systemctl stop "${u}" 2>/dev/null || true
+    systemctl disable "${u}" 2>/dev/null || true
+  done
+
+  rm -f "${SYSTEMD_DIR}/${SERVICE_PREFIX}@.service"
+  systemctl daemon-reload
+
+  rm -f /usr/local/bin/${BIN_NAME}
+  rm -rf "${INSTALL_DIR}" "${STATE_DIR}" "${LOG_DIR}"
+
+  if [[ "${keep_cfg}" == "purge" ]]; then
+    rm -rf "${CONFIG_DIR}"
+    ok "Uninstalled (including configs)."
+  else
+    ok "Uninstalled (configs kept at ${CONFIG_DIR})."
+  fi
+}
+
+cmd_setup(){
+  require_root
+  need_cmd curl systemctl ip awk sed grep xxd head openssl
+  ensure_dirs
+  [[ -x "${BIN_PATH}" ]] || cmd_download
+  cmd_configure
+  info "You can now: $0 start <instance>"
+}
+
+cmd_help(){
+  cat <<EOF
+${APP_NAME} Manager
+
+Usage:
+  sudo $0 setup
+  sudo $0 download
+  sudo $0 update
+  sudo $0 configure
+  sudo $0 gen-quic-cert
+
+  sudo $0 start <name>
+  sudo $0 stop <name>
+  sudo $0 restart <name>
+  sudo $0 enable <name>
+  sudo $0 disable <name>
+  sudo $0 remove <name>
+
+  sudo $0 status
+  sudo $0 list
+  sudo $0 logs <name> [lines]
+  sudo $0 follow <name>
+  sudo $0 check
+
+  sudo $0 uninstall [keep-config|purge]
+EOF
+}
+
+main(){
+  local cmd="${1:-help}"; shift || true
+  case "${cmd}" in
+    setup) cmd_setup "$@";;
+    download) cmd_download "$@";;
+    update) cmd_update "$@";;
+    configure) cmd_configure "$@";;
+    gen-quic-cert) cmd_gen_quic_cert "$@";;
+    start) cmd_start "$@";;
+    stop) cmd_stop "$@";;
+    restart) cmd_restart "$@";;
+    enable) cmd_enable "$@";;
+    disable) cmd_disable "$@";;
+    remove) cmd_remove "$@";;
+    status) cmd_status "$@";;
+    list) cmd_list "$@";;
+    logs) cmd_logs "$@";;
+    follow) cmd_follow "$@";;
+    check) cmd_check "$@";;
+    uninstall) cmd_uninstall "$@";;
+    help|-h|--help) cmd_help;;
+    *) die "Unknown command: ${cmd}. Run: $0 help";;
+  esac
+}
+
+main "$@"
