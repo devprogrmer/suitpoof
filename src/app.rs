@@ -7,13 +7,13 @@ use anyhow::{bail, Result};
 use async_channel as mpsc;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, Rng};
 use reqwest::StatusCode;
 use serde::Serialize;
 use sha2::Sha256;
 
 use crate::config::{Config, TunnelProtocol};
-use crate::port_forward::PortForwardGuard;
+use crate::port_forward::PortForwardRule;
 use crate::quic::{spawn_quic_client, spawn_quic_server};
 use crate::raw_socket::{PortFilter, RawReceiver, RawSender};
 use crate::tun::TunDevice;
@@ -471,7 +471,7 @@ async fn run_tun_client(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
     let forward_ports = cfg.effective_forward_ports();
     log::debug!("client forward_ports count={}", forward_ports.len());
 
-    let _port_forward = PortForwardGuard::apply(&cfg)?;
+    let _port_forward = PortForwardRule::apply(&cfg)?;
 
     let pool = TunnelPool::new();
 
