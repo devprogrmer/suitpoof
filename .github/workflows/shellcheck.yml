@@ -2,10 +2,13 @@ name: ShellCheck
 
 on:
   push:
-    branches: [ "main" ]
+    paths:
+      - "suit-manager.sh"
+      - ".github/workflows/shellcheck.yml"
   pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
+    paths:
+      - "suit-manager.sh"
+      - ".github/workflows/shellcheck.yml"
 
 jobs:
   shellcheck:
@@ -17,6 +20,5 @@ jobs:
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:
-          scandir: '.'
-          severity: warning
-          additional_files: 'suit-manager.sh'
+          scandir: .
+          ignore_paths: .git
