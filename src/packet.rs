@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-#[derive(Debug, Clone, PartialEq, Eq)] // 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketKind {
     Syn,
     Data,
