@@ -13,7 +13,12 @@ use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
 use crate::mux_fec::MuxFecConfig;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MuxFecConfig {}
 use crate::xor::XorCipher;
 
 // ── DPI obfuscation settings ──────────────────────────────────────────────────
