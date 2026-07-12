@@ -6,8 +6,8 @@
 //! - The same startup banner and auto-tune summary helpers as before
 //!
 //! Output format (terminal):
-//! ```
-//! 14:23:01 [INFO ] [app] CandyTunnel client starting …
+//! ```text
+//! 14:23:01 [INFO ] [app] suit client starting ...
 //! ```
 //! Level colours (simplelog built-in):
 //!   ERROR → red   WARN → yellow   INFO → cyan   DEBUG → blue   TRACE → white
@@ -42,7 +42,7 @@ fn parse_level(level: &str) -> LevelFilter {
 
 /// Build a `simplelog` [`Config`] that:
 /// - Shows timestamp, level, and target (module path)
-/// - Strips the noisy `CandyTunnel::` crate prefix from target strings
+/// - Strips the noisy `suit::` crate prefix from target strings
 fn build_config() -> Config {
     ConfigBuilder::new()
         .set_time_format_rfc3339() // ISO-8601 timestamps
