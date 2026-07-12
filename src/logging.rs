@@ -108,7 +108,7 @@ pub fn print_banner(role: &str, version: &str) {
 {c5}╚██████╗██║  ██║██║ ╚████║██████╔╝   ██║   {R}\n\
 {c6} ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝    ╚═╝  {R}\n\
 {DIM} ─────────────────────────────────────────{R}\n\
- {BOLD}{CYAN}CandyTunnel{R}  {DIM}v{version}{R}  {YELLOW}{role}{R}\n\
+ {BOLD}{CYAN}suit{R}  {DIM}v{version}{R}  {YELLOW}{role}{R}\n\
 {DIM} ─────────────────────────────────────────{R}\n",
         c1 = "\x1b[1;38;5;208m",
         c2 = "\x1b[1;38;5;214m",
