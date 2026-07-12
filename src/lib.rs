@@ -10,7 +10,9 @@ pub mod raw_socket;
 pub mod xor;
 #[cfg(target_os = "linux")]
 pub mod tunnel;
+#[cfg(target_os = "linux")]
 pub mod mux_fec;
+#[cfg(target_os = "linux")]
 pub mod quic;
 #[cfg(target_os = "linux")]
 pub mod app;
@@ -21,4 +23,5 @@ pub mod tun_bridge;
 pub mod port_forward;
 pub mod tuning;
 pub mod logging;
+#[cfg(target_os = "linux")]
 pub mod check;
