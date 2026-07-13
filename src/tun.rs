@@ -260,7 +260,6 @@ fn attach_tun(fd: RawFd, name: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 fn configure_interface(
     if_name: &str,
     addr: Ipv4Addr,
