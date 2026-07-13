@@ -19,7 +19,7 @@ BIN_PATH="${INSTALL_DIR}/${BIN_NAME}"
 VERSION_FILE="${INSTALL_DIR}/VERSION"
 
 REPO_OWNER="devprogrmer"
-REPO_NAME="suitpoof"
+REPO_NAME="suitspoof"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 
 BOLD='\033[1m'; DIM='\033[2m'
@@ -434,7 +434,7 @@ cmd_remove(){
   [[ -n "${n}" ]] || die "Usage: $0 remove <name>"
   systemctl stop "$(unit_name "${n}")" 2>/dev/null || true
   systemctl disable "$(unit_name "${n}")" 2>/dev/null || true
-  rm -f "${CONFIG_DIR}/${n}.toml}"
+  rm -f "${CONFIG_DIR}/${n}.toml"
   ok "Removed instance ${n}"
 }
 
